@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  // 1. Tangkap URL target yang dikirim oleh 9Router
+  // 1. Tangkap URL target dari header x-target-url atau query target
   const targetUrl = req.headers['x-target-url'] || req.query.target;
 
   if (!targetUrl) {
@@ -8,46 +8,66 @@ export default async function handler(req, res) {
     });
   }
 
-  // 2. Salin header request dan hapus IP VPS agar tidak terdeteksi
+  // 2. Salin header request & hapus header internal/IP VPS
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    // Abaikan header internal Vercel dan header IP VPS
     if (
       !key.startsWith('x-vercel-') &&
-      !['host', 'x-forwarded-for', 'x-real-ip', 'x-target-url'].includes(key.toLowerCase())
+      !['host', 'x-forwarded-for', 'x-real-ip', 'x-target-url', 'content-length'].includes(key.toLowerCase())
     ) {
       headers[key] = value;
     }
   }
 
   try {
-    // 3. Baca body request jika ada
-    let body = null;
+    // 3. Tangani Request Body dengan Aman (mencegah Body Hilang/Kosong)
+    let body = undefined;
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-      const buffers = [];
-      for await (const chunk of req) {
-        buffers.push(chunk);
+      if (typeof req.body === 'string' || Buffer.isBuffer(req.body)) {
+        body = req.body;
+      } else if (typeof req.body === 'object' && req.body !== null) {
+        body = JSON.stringify(req.body);
+      } else {
+        // Fallback jika body belum di-parse oleh Vercel
+        const buffers = [];
+        for await (const chunk of req) {
+          buffers.push(chunk);
+        }
+        body = Buffer.concat(buffers);
       }
-      body = Buffer.concat(buffers);
     }
 
-    // 4. Kirim request ke API tujuan menggunakan IP Vercel
+    // 4. Kirim request ke target AI Provider
     const response = await fetch(targetUrl, {
       method: req.method,
       headers: headers,
       body: body,
     });
 
-    // 5. Kembalikan respons balik ke 9Router
+    // 5. Teruskan HTTP Status Code & Response Headers balik ke 9Router
     res.status(response.status);
     response.headers.forEach((value, key) => {
-      res.setHeader(key, value);
+      // Abaikan encoding kompresi ganda
+      if (!['content-encoding', 'content-length'].includes(key.toLowerCase())) {
+        res.setHeader(key, value);
+      }
     });
 
-    const responseData = await response.arrayBuffer();
-    res.send(Buffer.from(responseData));
+    // 6. Teruskan Stream Response (Support Streaming / SSE dari AI Model)
+    if (response.body) {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(Buffer.from(value));
+      }
+      return res.end();
+    } else {
+      const data = await response.arrayBuffer();
+      return res.send(Buffer.from(data));
+    }
 
   } catch (error) {
-    res.status(500).json({ error: 'Proxy Error: ' + error.message });
+    return res.status(500).json({ error: 'Proxy Forward Error: ' + error.message });
   }
 }
