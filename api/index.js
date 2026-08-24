@@ -1,21 +1,26 @@
 export default async function handler(req, res) {
-  // Fix Bug 2: Vercel selalu menormalisasi header ke lowercase
   const target = req.headers['x-target-url'];
   if (!target) {
     return res.status(400).json({ error: 'Missing target URL. Header x-target-url is required.' });
   }
 
+  // Fungsi pembantu untuk menembak fetch
+  const executeFetch = async (fetchUrl, options) => {
+    return await fetch(fetchUrl, {
+      ...options,
+      redirect: 'follow',
+    });
+  };
+
   try {
-    // Fix Bug 1: Baca body dengan aman (HANYA SEKALI) tanpa memicu stream hang/520
+    // 1. Tangani Request Body
     let body = undefined;
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       if (req.body) {
-        // Jika Vercel sudah mengurai req.body
         body = typeof req.body === 'string' || Buffer.isBuffer(req.body) 
           ? req.body 
           : JSON.stringify(req.body);
       } else {
-        // Fallback jika raw body belum diurai oleh Vercel
         const chunks = [];
         for await (const chunk of req) {
           chunks.push(chunk);
@@ -24,7 +29,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Kumpulkan header request (skip header internal / hop-by-hop)
+    // 2. Kumpulkan Header
     const headers = { 
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' 
     };
@@ -35,15 +40,29 @@ export default async function handler(req, res) {
       }
     }
 
-    // Tembak target URL
-    const response = await fetch(target, {
-      method: req.method,
-      headers,
-      body,
-      redirect: 'follow',
-    });
+    const fetchOptions = { method: req.method, headers, body };
 
-    // Forward status code & response headers (skip hop-by-hop)
+    // 3. Eksekusi request utama
+    let response = await executeFetch(target, fetchOptions);
+
+    // 4. Fallback ke Jina Reader (HANYA jika GET request & tembak target gagal/ter-block 403/503)
+    if (!response.ok && req.method === 'GET' && [403, 502, 503].includes(response.status)) {
+      try {
+        const jinaUrl = `https://r.jina.ai/${target}`;
+        const jinaResponse = await executeFetch(jinaUrl, {
+          method: 'GET',
+          headers: { 'User-Agent': headers['User-Agent'] }
+        });
+
+        if (jinaResponse.ok) {
+          response = jinaResponse; // Gunakan hasil dari Jina jika berhasil
+        }
+      } catch (jinaErr) {
+        // Jika Jina gagal, tetap gunakan response original
+      }
+    }
+
+    // 5. Forward HTTP Status & Response Headers
     res.status(response.status);
     response.headers.forEach((value, key) => {
       if (!['connection', 'keep-alive', 'transfer-encoding', 'content-encoding', 'content-length'].includes(key.toLowerCase())) {
@@ -51,7 +70,7 @@ export default async function handler(req, res) {
       }
     });
 
-    // Stream Response (Krusial untuk Hermes & AI Client)
+    // 6. Stream Response (untuk AI Streaming) atau Send Buffer
     if (response.body) {
       const reader = response.body.getReader();
       while (true) {
