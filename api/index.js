@@ -3,21 +3,31 @@ export default async function handler(req, res) {
   if (!target) return res.status(400).json({ error: 'Missing target URL. Header x-target-url is required.' });
 
   try {
-    // 1. Kumpulkan header penting & pertahankan header bawaan jika ada
+    // 1. Kumpulkan header request
     const headers = { 
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' 
     };
 
     for (const [key, value] of Object.entries(req.headers)) {
-      if (!['host', 'x-forwarded-for', 'x-real-ip', 'x-target-url', 'x-vercel-proxy-signature'].includes(key.toLowerCase())) {
+      if (!['host', 'x-forwarded-for', 'x-real-ip', 'x-target-url', 'x-vercel-proxy-signature', 'content-length'].includes(key.toLowerCase())) {
         headers[key] = value;
       }
     }
 
-    // 2. Forward Body secara penuh (Support GET, POST, PUT, DELETE)
+    // 2. Tangani Request Body Native Node.js Stream (Fix untuk Vercel Serverless)
     let body = undefined;
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-      body = await req.text();
+      if (typeof req.body === 'string' || Buffer.isBuffer(req.body)) {
+        body = req.body;
+      } else if (typeof req.body === 'object' && req.body !== null) {
+        body = JSON.stringify(req.body);
+      } else {
+        const buffers = [];
+        for await (const chunk of req) {
+          buffers.push(chunk);
+        }
+        body = Buffer.concat(buffers);
+      }
     }
 
     // 3. Tembak target URL
@@ -28,7 +38,7 @@ export default async function handler(req, res) {
       redirect: 'follow',
     });
 
-    // 4. Salin HTTP Status Code & Response Headers (skip hop-by-hop)
+    // 4. Salin HTTP Status Code & Response Headers
     res.status(response.status);
     response.headers.forEach((value, key) => {
       if (!['connection', 'keep-alive', 'transfer-encoding', 'content-encoding'].includes(key.toLowerCase())) {
@@ -36,7 +46,7 @@ export default async function handler(req, res) {
       }
     });
 
-    // 5. Stream Response (Sangat krusial untuk AI Model / Hermes)
+    // 5. Stream Response (Krusial untuk AI Model / Hermes)
     if (response.body) {
       const reader = response.body.getReader();
       while (true) {
